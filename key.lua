@@ -39,8 +39,8 @@ local Config = {
     KeyFileName     = "Mykey.txt", -- The name of the file where the valid key will be saved for auto-login
 
     -- [6] GUI Management
-    OldGuiName      = "anythint", -- Name of the old GUI to destroy if it's already open
-    MainGuiName     = "anythint", -- Name of the main script's GUI to check if it's already executing
+    OldGuiName      = "anything", -- Name of the old GUI to destroy if it's already open
+    MainGuiName     = "anything", -- Name of the main script's GUI to check if it's already executing
 
     -- [7] Hub Information & UI Text
     HubName         = "Zvolt hub", -- The main title shown at the top of the GUI
