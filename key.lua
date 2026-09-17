@@ -44,7 +44,8 @@ local Config = {
 
     -- [7] Hub Information & UI Text
     HubName         = "Zvolt hub", -- The main title shown at the top of the GUI
-    HubDescription  = "Test" -- The text shown below the title
+    HubDescription  = "
+The best FREE script" -- The text shown below the title
 }
 
 -------------------------------------------------------------------------------
