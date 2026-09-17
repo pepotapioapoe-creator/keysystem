@@ -20,10 +20,10 @@ local Config = {
     PlatoSecret     = "1ff6e02f-8f84-4e71-967a-8e7235c0158b", -- Your PlatoBoost Secret Key
 
     -- [2] Anti-Bypass / Global Secret Variable
-    Secret          = "1234", -- This makes the script ONLY run from the key script. Even if they copy the original obfuscated script to bypass the key, they won't be able to!
+    Secret          = "Code", -- This makes the script ONLY run from the key script. Even if they copy the original obfuscated script to bypass the key, they won't be able to!
     
     -- [3] Scripts & Links
-    MainScriptURL   = "https://raw.githubusercontent.com/pepotapioapoe-creator/keysystem/refs/heads/main/v2.lua", -- The raw URL of your main script
+    MainScriptURL   = "Link", -- The raw URL of your main script
     
     -- [4] Social Media Settings (Set to true to show, false to hide)
     ShowDiscord     = true,
@@ -39,8 +39,8 @@ local Config = {
     KeyFileName     = "Mykey.txt", -- The name of the file where the valid key will be saved for auto-login
 
     -- [6] GUI Management
-    OldGuiName      = "anything", -- Name of the old GUI to destroy if it's already open
-    MainGuiName     = "anything", -- Name of the main script's GUI to check if it's already executing
+    OldGuiName      = "anythint", -- Name of the old GUI to destroy if it's already open
+    MainGuiName     = "anythint", -- Name of the main script's GUI to check if it's already executing
 
     -- [7] Hub Information & UI Text
     HubName         = "Zvolt hub", -- The main title shown at the top of the GUI
