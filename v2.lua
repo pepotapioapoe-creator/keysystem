@@ -48,7 +48,7 @@ print(ProtectionConfig.HubName .. " Loaded Successfully!")
 
 
 --[[
-    ZVOLT HUB V2 — FRESH EDITION
+    ZVOLT HUB V2.43 — FRESH EDITION
     UI moderna + más funciones + mejor rendimiento
     By Zvolt
 ]]
@@ -60,7 +60,6 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local Lighting = game:GetService("Lighting")
 local StarterGui = game:GetService("StarterGui")
-local VirtualUser = game:GetService("VirtualUser")
 local localPlayer = Players.LocalPlayer
 local camera = workspace.CurrentCamera
 local mouse = localPlayer:GetMouse()
@@ -73,8 +72,9 @@ local settings = {
     targetPart = "Head", hitboxEnabled = false, hitboxSize = 8, wallbangEnabled = false,
     silentAimEnabled = false, silentHitChance = 100, silentPrediction = 0.12,
     silentBone = "Same as Aimbot", silentFov = 200,
-    magicBulletsEnabled = false,
+    magicBulletsEnabled = false, magicNotified = false,
     spyEnabled = false,
+    silentGame = "Universal",
     triggerbot = false, triggerDelay = 150, triggerWarned = false,
     aimDebug = false,
     aimAuto = false,
@@ -86,14 +86,15 @@ local settings = {
     aimDeadzone = 6,
     -- visuals
     espEnabled = false, espNames = true, espDistance = true, espHealthBar = true,
-    espBox = true, espTracer = false, tracerOrigin = "Bottom", espChams = true, espTool = false,
-    espRainbow = false, maxDistance = 1500,
+    espBox = true, espTracer = true, tracerOrigin = "Bottom", espChams = false, espTool = false,
+    espRainbow = false, maxDistance = 1500, skeleton = true,
     espXray = true,
     -- movement
     flyEnabled = false, flySpeed = 60, noclipEnabled = false, speedEnabled = false, customSpeed = 32,
     jumpEnabled = false, customJump = 100, bhopEnabled = false, infJumpEnabled = false,
     spinEnabled = false, spinSpeed = 50, ctrlClickTpEnabled = false, gravity = 196.2, antiVoid = false,
     tapTp = false, freecam = false,
+    jerkEnabled = false, jerkPower = 5,
     -- troll / tp
     trollTrackEnabled = false, trollOrbitEnabled = false, orbitSpeed = 3, orbitRadius = 6, trackDist = 3,
     flingEnabled = false, headSitEnabled = false, spectateEnabled = false,
@@ -104,10 +105,12 @@ local settings = {
     -- ui
     uiToggleKey = Enum.KeyCode.RightShift, theme = "Cyan", uiTransparency = 0,
     ghostMode = false,
+    verbose = false,
 }
 local DEFAULT_SPEED, DEFAULT_JUMP = 16, 50
 local hitboxOriginals, currentAimTarget = {}, nil
 local orbitAngle, spectating = 0, false
+local lastAimPart = nil -- objetivo del aimbot V1; magic lo sigue (declarado arriba para que magic lo vea)
 
 --// Snapshot original para restaurar todo al salir (anti-ban: no dejar huellas)
 local origLighting = {}
@@ -176,27 +179,22 @@ local function sameTeam(a, b)
     if a.Team == nil or b.Team == nil then return false end
     return a.Team == b.Team
 end
-local rayParams = RaycastParams.new()
-rayParams.FilterType = Enum.RaycastFilterType.Exclude
-local function hasWallBetween(fromPos, toPos, ignoreChar)
-    if not settings.wallCheck then return false end
-    local filter = {camera}
-    if localPlayer.Character then table.insert(filter, localPlayer.Character) end
-    if ignoreChar and ignoreChar.Parent then table.insert(filter, ignoreChar.Parent) end
-    rayParams.FilterDescendantsInstances = filter
-    local res = workspace:Raycast(fromPos, (toPos - fromPos), rayParams)
-    if res and res.Instance then
-        local m = res.Instance:FindFirstAncestorOfClass("Model")
-        if m and Players:GetPlayerFromCharacter(m) then return false end
-        return true
+-- (build sin silent: hasWallBetween/rayParams eliminados, nadie los usaba)
+local defaultsCaptured = false
+local function captureDefaults()
+    if defaultsCaptured then return end
+    local h = myHum()
+    if h then
+        DEFAULT_SPEED = h.WalkSpeed
+        DEFAULT_JUMP = h.JumpPower
+        defaultsCaptured = true
     end
-    return false
 end
 local function restoreDefaults()
     local h = myHum()
     if h then
         if not settings.speedEnabled then h.WalkSpeed = DEFAULT_SPEED end
-        if not settings.jumpEnabled then h.JumpPower = DEFAULT_JUMP h.UseJumpPower = true end
+        if not settings.jumpEnabled then h.JumpPower = DEFAULT_JUMP end
     end
     if not settings.hitboxEnabled then
         for part, size in pairs(hitboxOriginals) do
@@ -205,6 +203,17 @@ local function restoreDefaults()
         table.clear(hitboxOriginals)
     end
 end
+
+--// Anti-fugas: al re-ejecutar se matan loops e hilos de la instancia anterior.
+-- (Si no, cada execute duplica ESP/aim/fly y pelean entre sí.)
+if _G.__ZV_STOP then pcall(_G.__ZV_STOP) end
+local dead = false
+_G.__ZV_STOP = function() dead = true end
+if _G.__ZV_CONNS then
+    for _, c in ipairs(_G.__ZV_CONNS) do pcall(function() c:Disconnect() end) end
+end
+_G.__ZV_CONNS = {}
+local function ZCONN(c) table.insert(_G.__ZV_CONNS, c) return c end
 
 --// GUI raíz (nombres neutros: los anticheats escanean instancias con "hub", "aim", "esp", "zvolt", etc.)
 local function rndName()
@@ -220,10 +229,120 @@ end
 local gui = Instance.new("ScreenGui")
 gui.Name = rndName()
 gui:SetAttribute("ZV2", true)
+-- limpia restos de ejecuciones viejas: su GUI y su ESP pegado a personajes
+for _, pl in ipairs(Players:GetPlayers()) do
+    local ch = pl.Character
+    if ch then
+        for _, d in ipairs(ch:GetDescendants()) do
+            pcall(function() if d:GetAttribute("ZV2") then d:Destroy() end end)
+        end
+    end
+end
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 -- STEALTH: siempre PlayerGui. gethui/CoreGui es una bandera clásica para los anticheats.
 gui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+--// Texto discreto: el anticheat escanea PlayerGui (TextLabel/TextButton).
+-- Se traduce ANTES de crear el texto (sin flash). discreetOn=true siempre.
+-- Definido ANTES de notify() a proposito (scope Lua: notify lo captura como upvalue).
+-- DISCREET_ENABLED=false: nombres reales (el usuario confirmo que "ESP" no patea).
+-- Si vuelve el kick al ejecutar, poner en true y todo vuelve a neutro solo.
+local DISCREET_ENABLED = false
+local discreetOn = true
+local labelOrig = {}
+local DMDICT = {
+    {"SILENT AIM", "Sigilo"}, {"Silent Aim", "Sigilo"},
+    {"MAGIC BULLETS", "Proyectil"}, {"Magic Bullets", "Proyectil"},
+    {"TRIGGERBOT", "Disparo"}, {"Triggerbot", "Disparo"},
+    {"Trigger", "Disparo"}, {"TRIGGER", "DISPARO"},
+    {"Aimbot", "Asistencia"}, {"AIMBOT", "ASISTENCIA"},
+    {"Wallbang", "Muro"}, {"WALLBANG", "MURO"},
+    {"Hitbox", "Zona"}, {"HITBOX", "ZONA"},
+    {"Spinbot", "Giro"}, {"SPINBOT", "GIRO"},
+    {"Bunny Hop", "Rebote"},
+    {"Noclip", "Fase"}, {"NOCLIP", "FASE"},
+    {"Freecam", "Vista"}, {"FREECAM", "VISTA"},
+    {"Jerk anti-aim", "Movimiento"},
+    {"Tracker", "Seguir"}, {"tracker", "seguir"}, {"track", "seguir"},
+    {"Rapid Fire", "Rafaga"}, {"RAPID FIRE", "RAFAGA"},
+    {"Magic", "Proy"}, {"MAGIC", "PROY"},
+    {"Munición infinita", "Reserva"}, {"MUNICIÓN INFINITA", "RESERVA"},
+    {"Municion infinita", "Reserva"},
+    {"Fullbright", "Brillo"}, {"FULLBRIGHT", "BRILLO"},
+    {"Anti-AFK", "Presencia"}, {"Anti-Void", "Suelo"},
+    {"Super Jump", "Salto"}, {"SUPER JUMP", "SALTO"},
+    {"Jump Power", "Salto"}, {"JUMP POWER", "SALTO"},
+    {"Custom Speed", "Velocidad"}, {"CUSTOM SPEED", "VELOCIDAD"},
+    {"Speed", "Vel"}, {"SPEED", "VEL"},
+    {"Salto infinito", "Salto+"},
+    {"Ctrl + Click", "Click"},
+    {"Fling", "Empuje"}, {"FLING", "EMPUJE"},
+    {"Espectando", "Viendo"}, {"Espectar", "Ver"},
+    {"Spectate", "Ver"}, {"spectate", "ver"},
+    {"Server Hop", "Servidor"},
+    {"MODO FANTASMA", "FANTASMA"},
+    {"Modo Fantasma", "Fantasma"},
+    {"Modo AUTO", "Auto"},
+    {"SNAP directo", "Fijar"},
+    {"Fuerza bruta", "Amplio"},
+    {"Diagnóstico F9", "Info"},
+    {"Incluir NPCs/bots", "NPCs"},
+    {"Team Check", "Equipos"},
+    {"Chams", "Aura"}, {"CHAMS", "AURA"},
+    {"Tracers", "Lineas"}, {"Tracer", "Linea"},
+    {"Silent", "Sigilo"}, {"SILENT", "SIGILO"},
+    {"Troll", "Fun"}, {"TROLL", "FUN"},
+    {"Weapon", "Equipo"}, {"WEAPON", "EQUIPO"},
+    {"Combat", "Pelea"}, {"COMBAT", "PELEA"},
+    {"Visuals", "Vista"}, {"VISUALS", "VISTA"},
+    {"Movement", "Mover"}, {"MOVEMENT", "MOVER"},
+    {"Teleport", "Viaje"}, {"TELEPORT", "VIAJE"},
+    {"World", "Mundo"}, {"WORLD", "MUNDO"},
+    {"Config", "Ajustes"}, {"CONFIG", "AJUSTES"},
+    {"Keybinds", "Teclas"}, {"KEYBINDS", "TECLAS"},
+    {"ESP", "Radar"},
+    {"Fly", "Vuelo"}, {"FLY", "VUELO"},
+    {"FPS Boost", "Rendimiento"}, {"FPS BOOST", "RENDIMIENTO"},
+    {"X-ray", "Ver"},
+    {"Aim", "Asis"}, {"AIM", "ASIS"},
+    {"spin", "giro"}, {"Jerk", "Mov"},
+    {"TP", "Viaje"}, {"chetadas", "mejoradas"}, {"chetada", "mejorada"},
+    {"ZVOLT", "ZV"}, {"Zvolt", "ZV"},
+    {"HUB", ""},
+}
+local function repAll(s, find, repl)
+    local out, i = {}, 1
+    while true do
+        local a, b = s:find(find, i, true)
+        if not a then out[#out + 1] = s:sub(i) break end
+        out[#out + 1] = s:sub(i, a - 1)
+        out[#out + 1] = repl
+        i = b + 1
+    end
+    return table.concat(out)
+end
+local function discreetText(s)
+    s = tostring(s)
+    if not DISCREET_ENABLED then return s end
+    s = s:gsub("%b()", "")
+    for _, pr in ipairs(DMDICT) do s = repAll(s, pr[1], pr[2]) end
+    s = s:gsub("^%s+", ""):gsub("%s+$", ""):gsub("  +", " ")
+    return s
+end
+local function applyDiscreet()
+    for _, d in ipairs(gui:GetDescendants()) do
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            if labelOrig[d] == nil then labelOrig[d] = d.Text end
+            if discreetOn then
+                local ok, nt = pcall(discreetText, labelOrig[d])
+                if ok and nt ~= "" then d.Text = nt end
+            else
+                d.Text = labelOrig[d]
+            end
+        end
+    end
+end
 
 --// Notificaciones modernas (stack)
 local notifHolder = Instance.new("Frame")
@@ -238,6 +357,12 @@ notifLayout.VerticalAlignment = Enum.VerticalAlignment.Top
 notifLayout.Parent = notifHolder
 
 local function notify(title, text)
+    do
+        local ok1, nt1 = pcall(discreetText, title)
+        if ok1 and nt1 ~= "" then title = nt1 end
+        local ok2, nt2 = pcall(discreetText, text)
+        if ok2 and nt2 ~= "" then text = nt2 end
+    end
     local f = Instance.new("Frame")
     f.Size = UDim2.new(1, 0, 0, 64)
     f.BackgroundColor3 = COLOR_CARD
@@ -266,14 +391,18 @@ local function notify(title, text)
         tween(d, TweenInfo.new(0.3), {TextTransparency = 1})
         task.wait(0.32) pcall(function() f:Destroy() end)
     end)
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {Title = title, Text = text, Duration = 1.2})
-    end)
+    -- NOTA: no se usa StarterGui:SetCore a propósito (rompe módulos CoreGui en algunos executors)
+end
+-- Prints solo con Log F9 activado: el anticheat puede leer la consola y banear por el texto.
+local function dprint(...)
+    if settings.verbose then
+        print(...)
+    end
 end
 
 --// FOV + mira
 local fovFrame = Instance.new("Frame")
-fovFrame.Name = "Fov" fovFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+fovFrame.Name = "vista" fovFrame.AnchorPoint = Vector2.new(0.5, 0.5)
 fovFrame.BackgroundTransparency = 1 fovFrame.Visible = false fovFrame.Parent = gui
 local fovStroke = stroke(fovFrame, Accent(), 1.6) TagAccent(fovStroke, "Color")
 corner(fovFrame, 999)
@@ -285,10 +414,22 @@ snapLine.AnchorPoint = Vector2.new(0.5, 0.5) snapLine.BorderSizePixel = 0
 snapLine.BackgroundColor3 = Accent() snapLine.Visible = false snapLine.Parent = gui TagAccent(snapLine)
 -- Estado del aimbot en pantalla (diagnóstico en vivo, sin F9)
 local aimStatus = Instance.new("TextLabel")
-aimStatus.Size = UDim2.new(0, 340, 0, 18) aimStatus.Position = UDim2.new(0.5, -170, 1, -60)
+aimStatus.Size = UDim2.new(0, 340, 0, 18) aimStatus.Position = UDim2.new(0, 10, 0, 10)
 aimStatus.BackgroundTransparency = 1 aimStatus.Font = FONT_MAIN aimStatus.TextSize = 12
 aimStatus.TextColor3 = COLOR_SUBTEXT aimStatus.TextStrokeTransparency = 0.5
 aimStatus.Text = "" aimStatus.Parent = gui
+-- (build sin silent: etiqueta silentStatus eliminada; magicStatus la reemplaza)
+local magicStatus = Instance.new("TextLabel")
+magicStatus.Size = UDim2.new(0, 380, 0, 18) magicStatus.Position = UDim2.new(0, 10, 0, 30)
+magicStatus.BackgroundTransparency = 1 magicStatus.Font = FONT_MAIN magicStatus.TextSize = 11
+magicStatus.TextColor3 = COLOR_SUBTEXT magicStatus.TextStrokeTransparency = 0.5
+magicStatus.Text = "" magicStatus.Parent = gui
+-- Estado del ESP en pantalla (diagnóstico en vivo: cuantos ve y por que filtra)
+local espStatus = Instance.new("TextLabel")
+espStatus.Size = UDim2.new(0, 380, 0, 18) espStatus.Position = UDim2.new(0, 10, 0, 50)
+espStatus.BackgroundTransparency = 1 espStatus.Font = FONT_MAIN espStatus.TextSize = 11
+espStatus.TextColor3 = COLOR_SUBTEXT espStatus.TextStrokeTransparency = 0.5
+espStatus.Text = "" espStatus.Parent = gui
 
 --// Pantalla de carga
 local loader = Instance.new("Frame")
@@ -301,7 +442,7 @@ local loadGrad = Instance.new("UIGradient") loadGrad.Color = ColorSequence.new{C
 local loadSub = Instance.new("TextLabel")
 loadSub.Size = UDim2.new(1, 0, 0, 20) loadSub.Position = UDim2.new(0, 0, 0.42, 12)
 loadSub.BackgroundTransparency = 1 loadSub.Font = FONT_MAIN loadSub.TextSize = 12
-loadSub.TextColor3 = COLOR_SUBTEXT loadSub.Text = "FRESH EDITION • v2.25 FULL" loadSub.Parent = loader
+loadSub.TextColor3 = COLOR_SUBTEXT loadSub.Text = "FRESH EDITION • v2.43" loadSub.Parent = loader
 local loadBarBg = Instance.new("Frame")
 loadBarBg.Size = UDim2.new(0, 240, 0, 5) loadBarBg.Position = UDim2.new(0.5, -120, 0.42, 42)
 loadBarBg.BackgroundColor3 = COLOR_CARD2 loadBarBg.Parent = loader corner(loadBarBg, 99)
@@ -344,7 +485,7 @@ local logoSub = Instance.new("TextLabel")
 logoSub.Size = UDim2.new(1, -24, 0, 16) logoSub.Position = UDim2.new(0, 12, 0, 46)
 logoSub.BackgroundTransparency = 1 logoSub.Font = FONT_MAIN logoSub.TextSize = 10
 logoSub.TextXAlignment = Enum.TextXAlignment.Left logoSub.TextColor3 = COLOR_SUBTEXT
-logoSub.Text = "FRESH • v2.25 FULL" logoSub.Parent = side
+logoSub.Text = "FRESH • v2.43" logoSub.Parent = side
 
 local userLabel = Instance.new("TextLabel")
 userLabel.Size = UDim2.new(1, -24, 0, 18) userLabel.Position = UDim2.new(0, 12, 0, 68)
@@ -427,17 +568,17 @@ end
 local pages, tabBtns = {}, {}
 local TAB_INFO = {
     {id="combat",   icon="⚔️", title="Combat",   desc="Apunta, pega y domina."},
-    {id="visuals",  icon="👁️", title="Visuals",  desc="Ve todo antes que ellos."},
-    {id="movement", icon="🌀", title="Movement", desc="Muévete sin límites."},
-    {id="teleport", icon="📍", title="Teleport", desc="Viaja instantáneo."},
-    {id="troll",    icon="🤡", title="Troll",    desc="Modo payaso activado."},
+    {id="visuals",  icon="👁️", title="Visuals",    desc="Ve todo antes que ellos."},
+    {id="movement", icon="🌀", title="Movement",   desc="Muévete sin límites."},
+    {id="teleport", icon="📍", title="Teleport",      desc="Viaja instantáneo."},
+    {id="troll",    icon="🤡", title="Troll",     desc="Modo payaso activado."},
     {id="weapon",   icon="🔫", title="Weapon",   desc="Tus armas, chetadas."},
-    {id="world",    icon="🌍", title="World",    desc="Controla el mapa."},
-    {id="config",   icon="⚙️", title="Config",   desc="Teclas, tema y cuenta."},
+    {id="world",    icon="🌍", title="World",   desc="Controla el mapa."},
+    {id="config",   icon="⚙️", title="Config", desc="Teclas, tema y cuenta."},
 }
 local function createPage(id)
     local p = Instance.new("ScrollingFrame")
-    p.Name = id p.Size = UDim2.new(1, -24, 1, -12) p.Position = UDim2.new(0, 12, 0, 0)
+    p.Name = "pg" p.Size = UDim2.new(1, -24, 1, -12) p.Position = UDim2.new(0, 12, 0, 0)
     p.BackgroundTransparency = 1 p.Visible = false p.ScrollBarThickness = 3
     p.ScrollBarImageColor3 = Accent() p.CanvasSize = UDim2.new(0, 0, 0, 0)
     p.AutomaticCanvasSize = Enum.AutomaticSize.Y p.Parent = contentArea
@@ -449,6 +590,12 @@ local function createPage(id)
 end
 for _, t in ipairs(TAB_INFO) do createPage(t.id) end
 local function showPage(id, title, desc)
+    do
+        local ok1, nt1 = pcall(discreetText, title)
+        if ok1 and nt1 ~= "" then title = nt1 end
+        local ok2, nt2 = pcall(discreetText, desc)
+        if ok2 and nt2 ~= "" then desc = nt2 end
+    end
     for k, p in pairs(pages) do p.Visible = (k == id) end
     pageTitle.Text = title pageDesc.Text = desc
     for k, b in pairs(tabBtns) do
@@ -472,7 +619,7 @@ for i, t in ipairs(TAB_INFO) do
     lbl.BackgroundTransparency = 1 lbl.Font = FONT_MAIN lbl.TextSize = 12
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     lbl.TextColor3 = (i == 1) and COLOR_TEXT or COLOR_SUBTEXT
-    lbl.Text = t.icon .. "   " .. t.title lbl.Parent = b
+    lbl.Text = t.icon .. "   " .. discreetText(t.title) lbl.Parent = b
     b.MouseButton1Click:Connect(function() showPage(t.id, t.title, t.desc) end)
     -- hover
     b.MouseEnter:Connect(function() if not pages[t.id].Visible then tween(b, TweenInfo.new(0.15), {BackgroundTransparency = 0.4}) end end)
@@ -486,6 +633,7 @@ local toggleStates = {}
 local cardCount = 0
 local function createCard(page, titleText, height)
     cardCount = cardCount + 1
+    do local ok, nt = pcall(discreetText, titleText) if ok and nt ~= "" then titleText = nt end end
     local card = Instance.new("Frame")
     card.Size = UDim2.new(1, -12, 0, 0)
     card.AutomaticSize = Enum.AutomaticSize.Y
@@ -519,6 +667,7 @@ end
 
 local function createToggle(parent, text, callback, key, default)
     default = default or false
+    do local ok, nt = pcall(discreetText, text) if ok and nt ~= "" then text = nt end end
     local row = Instance.new("TextButton")
     row.Size = UDim2.new(1, 0, 0, 30) row.BackgroundTransparency = 1 row.Text = "" row.Parent = parent
     local lbl = Instance.new("TextLabel")
@@ -546,6 +695,7 @@ local function createToggle(parent, text, callback, key, default)
 end
 
 local function createSlider(parent, titlePrefix, defaultVal, minVal, maxVal, callback)
+    do local ok, nt = pcall(discreetText, titlePrefix) if ok and nt ~= "" then titlePrefix = nt end end
     local box = Instance.new("Frame")
     box.Size = UDim2.new(1, 0, 0, 46) box.BackgroundTransparency = 1 box.Parent = parent
     local label = Instance.new("TextLabel")
@@ -588,6 +738,7 @@ local function createSlider(parent, titlePrefix, defaultVal, minVal, maxVal, cal
 end
 
 local function createButton(parent, text, callback, accent)
+    do local ok, nt = pcall(discreetText, text) if ok and nt ~= "" then text = nt end end
     local b = Instance.new("TextButton")
     b.Size = UDim2.new(1, 0, 0, 34) b.Font = FONT_BOLD b.TextSize = 12
     b.TextColor3 = accent and Color3.fromRGB(8, 8, 12) or COLOR_TEXT
@@ -605,6 +756,7 @@ local function createButton(parent, text, callback, accent)
 end
 
 local function createDropdown(parent, title, list, default, callback)
+    do local ok, nt = pcall(discreetText, title) if ok and nt ~= "" then title = nt end end
     local idx = 1
     for i, v in ipairs(list) do if v == default then idx = i break end end
     local row = Instance.new("Frame")
@@ -616,12 +768,12 @@ local function createDropdown(parent, title, list, default, callback)
     local b = Instance.new("TextButton")
     b.Size = UDim2.new(0, 170, 0, 28) b.Position = UDim2.new(1, -170, 0.5, -14)
     b.BackgroundColor3 = COLOR_CARD2 b.Font = FONT_BOLD b.TextSize = 11
-    b.TextColor3 = Accent() b.Text = list[idx] b.Parent = row corner(b, 7)
+    b.TextColor3 = Accent() b.Text = discreetText(list[idx]) b.Parent = row corner(b, 7)
     stroke(b, Color3.fromRGB(45, 45, 65), 1)
     pcall(callback, list[idx])
     b.MouseButton1Click:Connect(function()
         idx = idx + 1 if idx > #list then idx = 1 end
-        b.Text = list[idx] pcall(callback, list[idx])
+        b.Text = discreetText(list[idx]) pcall(callback, list[idx])
     end)
     return b
 end
@@ -637,39 +789,14 @@ local function ghostBlock()
     return false
 end
 
+-- (build sin silent: perfiles eliminados)
+
 --// ===== CONSTRUIR PESTAÑAS =====
--- COMBAT (Silent primero para que se vea sin hacer scroll)
-local c4 = createCard(pages["combat"], "👻 Silent Aim (tiros fantasma)", 200)
-local tSilent
-tSilent = createToggle(c4, "Silent Aim ⚠️ hook detectable", function(v)
-    if v and ghostBlock() then tSilent.Set(false) return end
-    settings.silentAimEnabled = v
-    if v then tryEnableSilentAim() end
-    notify("Silent Aim", v and "Activado (usa el mismo FOV)" or "Desactivado")
-end, "silent")
-table.insert(riskyToggles, tSilent)
-createSlider(c4, "Hit Chance %", settings.silentHitChance, 1, 100, function(v) settings.silentHitChance = v end)
-createSlider(c4, "Silent FOV", settings.silentFov, 40, 500, function(v) settings.silentFov = v end)
-createSlider(c4, "Prediccion", 12, 0, 50, function(v) settings.silentPrediction = v / 100 end)
-createDropdown(c4, "Hueso silent", {"Head", "HumanoidRootPart", "UpperTorso", "LowerTorso", "Same as Aimbot"}, "Same as Aimbot", function(v)
-    settings.silentBone = v
-end)
-createToggle(c4, "Team Check", function(v) settings.teamCheck = v end)
-createToggle(c4, "Wall Check", function(v) settings.wallCheck = v end)
-local tMagic
-tMagic = createToggle(c4, "Magic Bullets ⚠️", function(v)
-    if v and ghostBlock() then tMagic.Set(false) return end
-    settings.magicBulletsEnabled = v
-    notify("Magic Bullets", v and "Activadas (usan FOV + predicción del silent)" or "Desactivadas")
-end)
-table.insert(riskyToggles, tMagic)
-createToggle(c4, "SPY del arma 🔍", function(v)
-    settings.spyEnabled = v
-    if v then tryEnableSpy() notify("Spy", "Dispara varias veces y abre la consola con F9.") end
-end)
+-- COMBAT
+-- (build sin silent: card Sigilo/Silent/SPY eliminada; Magia vive en Armas)
 
 local c1 = createCard(pages["combat"], "🎯 Aimbot", 250)
-createToggle(c1, "Aimbot · click derecho", function(v) settings.aimEnabled = v end, "aimbot")
+createToggle(c1, "Aimbot", function(v) settings.aimEnabled = v end, "aimbot")
 createDropdown(c1, "Hueso objetivo", {"Head", "HumanoidRootPart", "UpperTorso", "LowerTorso"}, "Head", function(v) settings.targetPart = v end)
 createToggle(c1, "Modo AUTO", function(v) settings.aimAuto = v end)
 createToggle(c1, "SNAP directo", function(v) settings.aimSnap = v end)
@@ -677,12 +804,12 @@ createToggle(c1, "Incluir NPCs/bots", function(v) settings.aimNpcs = v end)
 createToggle(c1, "Diagnóstico F9", function(v) settings.aimDebug = v end)
 createToggle(c1, "Fuerza bruta", function(v) settings.aimBrute = v end)
 local tTrigger
-tTrigger = createToggle(c1, "Triggerbot · auto-disparo", function(v)
+tTrigger = createToggle(c1, "Triggerbot", function(v)
     if v and ghostBlock() then tTrigger.Set(false) return end
     settings.triggerbot = v
 end)
 table.insert(riskyToggles, tTrigger)
-createSlider(c1, "Retraso disparo", settings.triggerDelay, 0, 500, function(v) settings.triggerDelay = v end)
+createSlider(c1, "Retraso Trigger", settings.triggerDelay, 0, 500, function(v) settings.triggerDelay = v end)
 
 local c2 = createCard(pages["combat"], "⭕ FOV & Suavizado", 190)
 createSlider(c2, "Radio FOV", settings.fovRadius, 40, 400, function(v) settings.fovRadius = v end)
@@ -693,47 +820,42 @@ createToggle(c2, "FOV arcoíris 🌈", function(v) settings.fovRainbow = v end)
 
 local c3 = createCard(pages["combat"], "💥 Daño & Paredes", 150)
 local tHitbox
-tHitbox = createToggle(c3, "Hitbox Extender ⚠️ MUY detectable", function(v)
+tHitbox = createToggle(c3, "Hitbox", function(v)
     if v and ghostBlock() then tHitbox.Set(false) return end
     settings.hitboxEnabled = v if not v then restoreDefaults() end
 end, "hitbox")
 table.insert(riskyToggles, tHitbox)
 createSlider(c3, "Tamaño Hitbox", settings.hitboxSize, 2, 25, function(v) settings.hitboxSize = v end)
-local tWallbang
-tWallbang = createToggle(c3, "Wallbang + X-ray ⚠️", function(v)
-    if v and ghostBlock() then tWallbang.Set(false) return end
-    settings.wallbangEnabled = v
-end)
-table.insert(riskyToggles, tWallbang)
+-- (build sin silent: wallbang real solo existía vía silent, toggle eliminado)
 
 -- VISUALS
-local v1 = createCard(pages["visuals"], "👁️ ESP Principal", 280)
-createToggle(v1, "ESP Players", function(v) settings.espEnabled = v end, "esp")
+local v1 = createCard(pages["visuals"], "👁️ ESP", 280)
+createToggle(v1, "ESP", function(v) settings.espEnabled = v end, "esp")
 createToggle(v1, "Nombres", function(v) settings.espNames = v end, nil, true)
 createToggle(v1, "Distancia [m]", function(v) settings.espDistance = v end, nil, true)
 createToggle(v1, "Barra de vida", function(v) settings.espHealthBar = v end, nil, true)
-createToggle(v1, "Caja 2D (Box)", function(v) settings.espBox = v end, nil, true)
-createToggle(v1, "Tracers / Líneas", function(v) settings.espTracer = v end)
-createToggle(v1, "Chams (resaltado)", function(v) settings.espChams = v end, nil, true)
+createToggle(v1, "Caja 2D", function(v) settings.espBox = v end, nil, true)
+createToggle(v1, "Tracers", function(v) settings.espTracer = v end, nil, true)
+createToggle(v1, "Esqueleto", function(v) settings.skeleton = v end, nil, true)
 createToggle(v1, "Ver herramienta en mano 🔫", function(v) settings.espTool = v end)
-createToggle(v1, "Chams X-ray", function(v) settings.espXray = v end, nil, true)
+createToggle(v1, "Team Check", function(v) settings.teamCheck = v end)
 
-local v2 = createCard(pages["visuals"], "🎨 Estilo ESP", 160)
-createDropdown(v2, "Origen de líneas", {"Bottom", "Center", "Mouse"}, "Bottom", function(v) settings.tracerOrigin = v end)
-createToggle(v2, "ESP arcoíris 🌈", function(v) settings.espRainbow = v end)
+local v2 = createCard(pages["visuals"], "🎨 Estilo", 160)
+createDropdown(v2, "Lineas", {"Bottom", "Center", "Mouse"}, "Bottom", function(v) settings.tracerOrigin = v end)
+createToggle(v2, "ESP Arcoíris", function(v) settings.espRainbow = v end)
 createSlider(v2, "Distancia máxima", settings.maxDistance, 100, 5000, function(v) settings.maxDistance = v end)
 
 -- MOVEMENT
 local m1 = createCard(pages["movement"], "✈️ Vuelo & Noclip", 150)
 local tFly
-tFly = createToggle(m1, "Fly ⚠️", function(v)
+tFly = createToggle(m1, "Fly", function(v)
     if v and ghostBlock() then tFly.Set(false) return end
     settings.flyEnabled = v
 end, "fly")
 table.insert(riskyToggles, tFly)
 createSlider(m1, "Velocidad de vuelo", settings.flySpeed, 10, 200, function(v) settings.flySpeed = v end)
 local tNoclip
-tNoclip = createToggle(m1, "Noclip (atravesar todo)", function(v)
+tNoclip = createToggle(m1, "Noclip", function(v)
     if v and ghostBlock() then tNoclip.Set(false) return end
     settings.noclipEnabled = v
 end, "noclip")
@@ -741,19 +863,19 @@ table.insert(riskyToggles, tNoclip)
 
 local m2 = createCard(pages["movement"], "🏃 Velocidad & Salto", 240)
 local tSpeed
-tSpeed = createToggle(m2, "Custom Speed ⚠️ detectable", function(v)
+tSpeed = createToggle(m2, "Custom Speed", function(v)
     if v and ghostBlock() then tSpeed.Set(false) return end
     settings.speedEnabled = v if not v then local h = myHum() if h then h.WalkSpeed = DEFAULT_SPEED end end
 end, "speed")
 table.insert(riskyToggles, tSpeed)
-createSlider(m2, "WalkSpeed", settings.customSpeed, 16, 150, function(v) settings.customSpeed = v end)
+createSlider(m2, "Speed", settings.customSpeed, 16, 150, function(v) settings.customSpeed = v end)
 local tJump
 tJump = createToggle(m2, "Super Jump", function(v)
     if v and ghostBlock() then tJump.Set(false) return end
     settings.jumpEnabled = v if not v then local h = myHum() if h then h.JumpPower = DEFAULT_JUMP end end
 end, "jump")
 table.insert(riskyToggles, tJump)
-createSlider(m2, "JumpPower", settings.customJump, 50, 350, function(v) settings.customJump = v end)
+createSlider(m2, "Jump Power", settings.customJump, 50, 350, function(v) settings.customJump = v end)
 local tBhop
 tBhop = createToggle(m2, "Bunny Hop", function(v)
     if v and ghostBlock() then tBhop.Set(false) return end
@@ -769,12 +891,19 @@ table.insert(riskyToggles, tInfJump)
 
 local m3 = createCard(pages["movement"], "🌀 Extra", 190)
 local tSpin
-tSpin = createToggle(m3, "Spinbot ⚠️ detectable", function(v)
+tSpin = createToggle(m3, "Spinbot", function(v)
     if v and ghostBlock() then tSpin.Set(false) return end
     settings.spinEnabled = v
 end, "spinbot")
 table.insert(riskyToggles, tSpin)
 createSlider(m3, "Velocidad spin", settings.spinSpeed, 5, 200, function(v) settings.spinSpeed = v end)
+local tJerk
+tJerk = createToggle(m3, "Jerk anti-aim ⚠️", function(v)
+    if v and ghostBlock() then tJerk.Set(false) return end
+    settings.jerkEnabled = v
+end)
+table.insert(riskyToggles, tJerk)
+createSlider(m3, "Fuerza Jerk", settings.jerkPower, 1, 10, function(v) settings.jerkPower = v end)
 local tCtrl
 tCtrl = createToggle(m3, "Ctrl + Click TP 🖱️", function(v)
     if v and ghostBlock() then tCtrl.Set(false) return end
@@ -787,12 +916,13 @@ createSlider(m3, "Gravedad", 196, 0, 400, function(v)
     settings.gravity = v pcall(function() workspace.Gravity = v end)
 end)
 local tTap
-tTap = createToggle(m3, "Tap TP táctil", function(v)
+tTap = createToggle(m3, "TP Táctil", function(v)
     if v and ghostBlock() then tTap.Set(false) return end
     settings.tapTp = v
 end)
 table.insert(riskyToggles, tTap)
 UserInputService.TouchTapInWorld:Connect(function(pos, processed)
+    if dead then return end
     if processed then return end
     if not settings.tapTp or settings.ghostMode then return end
     local r = myRoot()
@@ -813,6 +943,7 @@ createToggle(m3, "Freecam", function(v)
     if not v then restoreFreecam() end
 end)
 RunService.RenderStepped:Connect(function(dt)
+    if dead then return end
     if not settings.freecam then return end
     if camera.CameraType ~= Enum.CameraType.Scriptable then
         if freecamPrev == nil then freecamPrev = {camera.CameraSubject, camera.CameraType} end
@@ -836,7 +967,7 @@ RunService.RenderStepped:Connect(function(dt)
 end)
 
 -- TELEPORT
-local t1 = createCard(pages["teleport"], "📍 Teleport a jugadores", 380)
+local t1 = createCard(pages["teleport"], "📍 Teleport", 380)
 local searchBox = Instance.new("TextBox")
 searchBox.Size = UDim2.new(1, 0, 0, 30) searchBox.BackgroundColor3 = COLOR_CARD2
 searchBox.Font = FONT_MAIN searchBox.TextSize = 12 searchBox.TextColor3 = COLOR_TEXT
@@ -870,16 +1001,17 @@ local function refreshPlayers()
     plist.CanvasSize = UDim2.new(0, 0, 0, n * 33)
 end
 searchBox:GetPropertyChangedSignal("Text"):Connect(refreshPlayers)
-Players.PlayerAdded:Connect(refreshPlayers) Players.PlayerRemoving:Connect(refreshPlayers)
+Players.PlayerAdded:Connect(function() if not dead then refreshPlayers() end end)
+Players.PlayerRemoving:Connect(function() if not dead then refreshPlayers() end end)
 refreshPlayers()
 local btnRow = Instance.new("Frame") btnRow.Size = UDim2.new(1, 0, 0, 34) btnRow.BackgroundTransparency = 1 btnRow.Parent = t1
 local tpTweenBtn = Instance.new("TextButton")
 tpTweenBtn.Size = UDim2.new(0.48, 0, 1, 0) tpTweenBtn.BackgroundColor3 = Accent() tpTweenBtn.Font = FONT_BOLD tpTweenBtn.TextSize = 11
-tpTweenBtn.TextColor3 = Color3.fromRGB(8,8,12) tpTweenBtn.Text = "✨ TP SUAVE" tpTweenBtn.Parent = btnRow corner(tpTweenBtn, 8) TagAccent(tpTweenBtn)
+tpTweenBtn.TextColor3 = Color3.fromRGB(8,8,12) tpTweenBtn.Text = discreetText("✨ TP SUAVE") tpTweenBtn.Parent = btnRow corner(tpTweenBtn, 8) TagAccent(tpTweenBtn)
 local tpFastBtn = Instance.new("TextButton")
 tpFastBtn.Size = UDim2.new(0.48, 0, 1, 0) tpFastBtn.Position = UDim2.new(0.52, 0, 0, 0)
 tpFastBtn.BackgroundColor3 = COLOR_CARD2 tpFastBtn.Font = FONT_BOLD tpFastBtn.TextSize = 11
-tpFastBtn.TextColor3 = COLOR_TEXT tpFastBtn.Text = "⚡ TP INSTANT" tpFastBtn.Parent = btnRow corner(tpFastBtn, 8)
+tpFastBtn.TextColor3 = COLOR_TEXT tpFastBtn.Text = discreetText("⚡ TP INSTANT") tpFastBtn.Parent = btnRow corner(tpFastBtn, 8)
 tpTweenBtn.MouseButton1Click:Connect(function()
     if ghostBlock() then return end
     local tp = settings.selectedTpPlayer local mr, tr = myRoot(), targetRootOf(tp)
@@ -907,6 +1039,7 @@ end)
 table.insert(riskyToggles, tFollow)
 task.spawn(function()
     while true do
+        if dead then break end
         task.wait(0.5)
         if settings.tpFollow and not settings.ghostMode then
             local tp, mr = settings.selectedTpPlayer, myRoot()
@@ -941,9 +1074,9 @@ tTrack = createToggle(tr1, "Tracker", function(v)
     if v then settings.trollOrbitEnabled = false settings.flingEnabled = false settings.headSitEnabled = false end
 end)
 table.insert(riskyToggles, tTrack)
-createSlider(tr1, "Distancia tracker", settings.trackDist, 1, 10, function(v) settings.trackDist = v end)
+createSlider(tr1, "Distancia track", settings.trackDist, 1, 10, function(v) settings.trackDist = v end)
 local tOrbit
-tOrbit = createToggle(tr1, "Órbita", function(v)
+tOrbit = createToggle(tr1, "Orbita", function(v)
     if v and ghostBlock() then tOrbit.Set(false) return end
     settings.trollOrbitEnabled = v
     if v then settings.trollTrackEnabled = false settings.flingEnabled = false settings.headSitEnabled = false end
@@ -961,13 +1094,13 @@ tFling = createToggle(tr2, "Fling", function(v)
 end)
 table.insert(riskyToggles, tFling)
 local tHeadSit
-tHeadSit = createToggle(tr2, "Sentarse en su cabeza 🪑", function(v)
+tHeadSit = createToggle(tr2, "Sentarse 🪑", function(v)
     if v and ghostBlock() then tHeadSit.Set(false) return end
     settings.headSitEnabled = v
     if v then settings.trollTrackEnabled = false settings.trollOrbitEnabled = false end
 end)
 table.insert(riskyToggles, tHeadSit)
-createToggle(tr2, "Espectar", function(v)
+createToggle(tr2, "Mirar", function(v)
     settings.spectateEnabled = v spectating = v
     if not v then pcall(function() camera.CameraSubject = myHum() end) end
 end)
@@ -993,6 +1126,19 @@ tRapid = createToggle(w1, "Rapid Fire", function(v)
     settings.rapidFire = v
 end)
 table.insert(riskyToggles, tRapid)
+local tMagic
+tMagic = createToggle(w1, "Magic Bullets ⚠️", function(v)
+    if v and ghostBlock() then tMagic.Set(false) return end
+    settings.magicBulletsEnabled = v
+    settings.magicNotified = false
+    if v then
+        notify("Magic Bullets", "Activadas: siguen al objetivo del aimbot")
+    else
+        notify("Magic Bullets", "Desactivadas")
+    end
+end)
+table.insert(riskyToggles, tMagic)
+createSlider(w1, "Prediccion", 12, 0, 50, function(v) settings.silentPrediction = v / 100 end)
 createButton(w1, "🧹 Reset cámara", function()
     camera.FieldOfView = 70 notify("Weapon", "Cámara reseteada.")
 end, false)
@@ -1000,7 +1146,7 @@ createButton(w1, "🔍 Ver arma · F9", function()
     local tp = settings.selectedTpPlayer
     if tp and tp.Character then
         for _, t in ipairs(tp.Character:GetChildren()) do
-            if t:IsA("Tool") then print("[ZVOLT] " .. tp.Name .. " tiene: " .. t.Name) end
+            if t:IsA("Tool") then dprint("[sys] " .. tp.Name .. " tiene: " .. t.Name) end
         end
         notify("Weapon", "Revisa la consola (F9).")
     end
@@ -1008,7 +1154,15 @@ end, false)
 
 -- WORLD
 local wo1 = createCard(pages["world"], "🌍 Iluminación & Mapa", 190)
-createToggle(wo1, "Fullbright 💡", function(v) settings.fullbright = v end)
+createToggle(wo1, "Fullbright 💡", function(v)
+    settings.fullbright = v
+    if v then
+        Lighting.Brightness = 2 Lighting.ClockTime = 14 Lighting.FogEnd = 100000
+        Lighting.Ambient = Color3.fromRGB(255, 255, 255) Lighting.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
+    else
+        restoreLighting()
+    end
+end)
 createButton(wo1, "☀️ Poner de día", function()
     Lighting.ClockTime = 14 Lighting.FogEnd = 100000 Lighting.Brightness = 2 Lighting.Ambient = Color3.fromRGB(255,255,255)
 end, false)
@@ -1027,7 +1181,7 @@ createToggle(wo2, "Sin sombras", function(v)
     if v then Lighting.GlobalShadows = false
     else Lighting.GlobalShadows = (origLighting.GlobalShadows == nil) and true or origLighting.GlobalShadows end
 end)
-createButton(wo2, "🚀 FPS BOOST", function()
+createButton(wo2, "🚀 FPS Boost", function()
     if settings.fpsBoosted then notify("World", "Ya está aplicado.") return end
     settings.fpsBoosted = true
     Lighting.GlobalShadows = false Lighting.FogEnd = 9e9
@@ -1047,20 +1201,28 @@ local function applyGhostOff()
     for _, t in ipairs(riskyToggles) do pcall(function() t.Set(false) end) end
     settings.hitboxEnabled = false settings.speedEnabled = false settings.jumpEnabled = false
     settings.flyEnabled = false settings.noclipEnabled = false settings.spinEnabled = false
-    settings.wallbangEnabled = false settings.silentAimEnabled = false settings.bhopEnabled = false
+    settings.bhopEnabled = false
     settings.infJumpEnabled = false settings.ctrlClickTpEnabled = false settings.trollTrackEnabled = false
     settings.trollOrbitEnabled = false settings.flingEnabled = false settings.headSitEnabled = false
     settings.ammoEnabled = false settings.rapidFire = false
     settings.magicBulletsEnabled = false
     settings.triggerbot = false settings.tapTp = false settings.tpFollow = false
+    settings.jerkEnabled = false
     restoreDefaults()
     pcall(function() workspace.Gravity = 196.2 end)
 end
-local cfGhost = createCard(pages["config"], "👻 Modo Fantasma", 90)
+local cfGhost = createCard(pages["config"], "👻 Fantasma", 90)
 local tGhost
 tGhost = createToggle(cfGhost, "MODO FANTASMA", function(v)
     settings.ghostMode = v
     if v then applyGhostOff() notify("Fantasma", "Solo queda lo invisible al servidor: ESP + aimbot camara + luz.") end
+end)
+createToggle(cfGhost, "Log F9 (solo diagnóstico)", function(v)
+    settings.verbose = v
+    if v then
+        notify("Consola", "Log activado: úsalo y apágalo, el anticheat lee la consola.")
+        print("[sys] verbose ON")
+    end
 end)
 local cf1 = createCard(pages["config"], "🎨 Tema", 150)
 local themeRow = Instance.new("Frame") themeRow.Size = UDim2.new(1, 0, 0, 32) themeRow.BackgroundTransparency = 1 themeRow.Parent = cf1
@@ -1075,7 +1237,7 @@ for name, th in pairs(THEMES) do
         notify("Tema", "Tema " .. name .. " activado ✨")
     end)
 end
-createToggle(cf1, "ESP arcoíris directo", function(v) settings.espRainbow = v end)
+createToggle(cf1, "Color ESP", function(v) settings.espRainbow = v end)
 createButton(cf1, "🔄 Resetear todo", function()
     settings.ghostMode = false
     pcall(function() tGhost.Set(false) end)
@@ -1089,6 +1251,7 @@ end, false)
 
 local cf2 = createCard(pages["config"], "⌨️ Keybinds", 330)
 local function keyRow(parent, labelName, bindKey)
+    do local ok, nt = pcall(discreetText, labelName) if ok and nt ~= "" then labelName = nt end end
     local row = Instance.new("Frame") row.Size = UDim2.new(1, 0, 0, 30) row.BackgroundTransparency = 1 row.Parent = parent
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(0, 180, 1, 0) lbl.BackgroundTransparency = 1
@@ -1136,12 +1299,12 @@ createButton(cf3, "📋 Copiar JobId", function()
     else
         notify("Cuenta", "JobId: " .. j)
     end
-    print("JOBID:", j)
+    dprint("JOBID:", j)
 end, false)
-createButton(cf3, "🗑️ Destruir Zvolt", function()
+createButton(cf3, "🗑️ Destruir GUI", function()
     restoreDefaults() restoreLighting()
     pcall(function() workspace.Gravity = 196.2 end)
-    pcall(function() RunService:UnbindFromRenderStep("ZV_Aimbot") end)
+    pcall(function() RunService:UnbindFromRenderStep("ZV_Cam") end)
     pcall(restoreCamType) pcall(restoreFreecam)
     pcall(function() camera.CameraSubject = myHum() camera.FieldOfView = 70 end) gui:Destroy()
 end, false)
@@ -1215,6 +1378,7 @@ aimBtn.InputEnded:Connect(function(i) aimingMobile = false aimBtn.BackgroundColo
 local aimingPC = false
 local isAimingRightClick = false
 UserInputService.InputBegan:Connect(function(inp, gp)
+    if dead then return end
     if inp.UserInputType == Enum.UserInputType.MouseButton2 then aimingPC = true isAimingRightClick = true end
     if gp then return end
     if inp.UserInputType == Enum.UserInputType.Keyboard then
@@ -1238,11 +1402,13 @@ UserInputService.InputBegan:Connect(function(inp, gp)
     end
 end)
 UserInputService.InputEnded:Connect(function(inp)
+    if dead then return end
     if inp.UserInputType == Enum.UserInputType.MouseButton2 then aimingPC = false isAimingRightClick = false end
 end)
 -- anti afk
 Players.LocalPlayer.Idled:Connect(function()
-    if settings.antiAfk then VirtualUser:CaptureController() VirtualUser:ClickButton2(Vector2.new()) end
+    if dead then return end
+    if settings.antiAfk then pcall(function() game:GetService("VirtualUser"):CaptureController() game:GetService("VirtualUser"):ClickButton2(Vector2.new()) end) end
 end)
 
 --// ESP moderno (Barra de vida + Box + Tracer + Nombre)
@@ -1264,6 +1430,7 @@ local function clearESP(plr)
     local o = espData[plr]
     if o then
         safeDestroy(o.hl) safeDestroy(o.bb) safeDestroy(o.line) safeDestroy(o.box)
+        if o.sk then for _, f in ipairs(o.sk) do safeDestroy(f) end end
         espData[plr] = nil
     end
     -- no tocamos espCharOf aquí a propósito en el loop por frame;
@@ -1273,18 +1440,48 @@ local function espColor()
     if settings.espRainbow then return Color3.fromHSV(tick() % 5 / 5, 1, 1) end
     return Accent()
 end
+--// ESP esqueleto sutil (R15 + fallback R6). Sin Highlight (muy fogoso).
+local SK_R15 = {
+    {"Head","UpperTorso"},{"UpperTorso","LowerTorso"},
+    {"UpperTorso","UpperArmLeft"},{"UpperArmLeft","LowerArmLeft"},{"LowerArmLeft","HandLeft"},
+    {"UpperTorso","UpperArmRight"},{"UpperArmRight","LowerArmRight"},{"LowerArmRight","HandRight"},
+    {"LowerTorso","UpperLegLeft"},{"UpperLegLeft","LowerLegLeft"},{"LowerLegLeft","FootLeft"},
+    {"LowerTorso","UpperLegRight"},{"UpperLegRight","LowerLegRight"},{"LowerLegRight","FootRight"},
+}
+local SK_R6 = {
+    {"Head","Torso"},{"Torso","Left Arm"},{"Torso","Right Arm"},{"Torso","Left Leg"},{"Torso","Right Leg"},
+}
+local function skSeg(objs, i)
+    local f = objs.sk[i]
+    if not f then
+        f = Instance.new("Frame")
+        f.AnchorPoint = Vector2.new(0.5, 0.5) f.BorderSizePixel = 0
+        f.BackgroundColor3 = Accent() f.Visible = false f.Parent = gui
+        objs.sk[i] = f
+    end
+    return f
+end
+local function drawSeg(f, ax, ay, bx, by, col)
+    local dx, dy = bx - ax, by - ay
+    local len = math.sqrt(dx * dx + dy * dy)
+    if len < 1 then f.Visible = false return end
+    f.Size = UDim2.new(0, 1.5, 0, len)
+    f.Position = UDim2.new(0, (ax + bx) / 2, 0, (ay + by) / 2)
+    f.Rotation = math.deg(math.atan2(dy, dx)) - 90
+    f.BackgroundColor3 = col f.Visible = true
+end
+local function hideSk(objs)
+    if objs.sk then for _, f in ipairs(objs.sk) do f.Visible = false end end
+end
 local function buildESP(plr, char)
     clearESP(plr)
     local objs = {}
-    if settings.espChams then
-        local hl = Instance.new("Highlight")
-        hl.Adornee = char hl.FillTransparency = 0.7 hl.OutlineTransparency = 0
-        hl.FillColor = espColor() hl.OutlineColor = espColor()
-        hl.DepthMode = (settings.espXray ~= false) and Enum.HighlightDepthMode.AlwaysOnTop or Enum.HighlightDepthMode.Occluded
-        hl.Parent = char objs.hl = hl
-    end
+    objs.sk = {}
     local bb = Instance.new("BillboardGui")
-    bb.Size = UDim2.new(0, 170, 0, 46) bb.StudsOffset = Vector3.new(0, 2.8, 0) bb.AlwaysOnTop = true bb.Parent = char
+    bb.Size = UDim2.new(0, 170, 0, 46) bb.StudsOffset = Vector3.new(0, 2.8, 0) bb.AlwaysOnTop = true
+    bb:SetAttribute("ZV2", true)
+    bb.Adornee = char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
+    bb.Parent = char
     local name = Instance.new("TextLabel")
     name.Size = UDim2.new(1, 0, 0, 16) name.BackgroundTransparency = 1
     name.Font = FONT_BOLD name.TextSize = 12 name.TextColor3 = Color3.fromRGB(255,255,255)
@@ -1314,11 +1511,11 @@ local function updateESP(plr)
     if not objs or espCharOf[plr] ~= char then buildESP(plr, char) objs = espData[plr] if not objs then return end end
     local hum = char:FindFirstChildOfClass("Humanoid")
     local lr = myRoot()
-    if not hum or not lr then return end
+    if not lr then return end
     local dist = math.floor((lr.Position - root.Position).Magnitude)
-    if dist > settings.maxDistance or hum.Health <= 0 then
+    if dist > settings.maxDistance or (hum and hum.Health <= 0) then
         objs.bb.Enabled = false objs.line.Visible = false objs.box.Visible = false
-        if objs.hl then objs.hl.Enabled = false end
+        hideSk(objs)
         return
     end
     local col = espColor()
@@ -1327,10 +1524,6 @@ local function updateESP(plr)
         col = Color3.fromRGB(90, 255, 130)
     end
     objs.bb.Enabled = true
-    if objs.hl then
-        objs.hl.Enabled = true
-        objs.hl.DepthMode = (settings.espXray ~= false) and Enum.HighlightDepthMode.AlwaysOnTop or Enum.HighlightDepthMode.Occluded
-    end
     -- nombre + dist
     local txt = ""
     if settings.espNames then txt = plr.DisplayName .. " " end
@@ -1338,9 +1531,9 @@ local function updateESP(plr)
     objs.name.Text = txt ~= "" and txt or plr.Name
     objs.name.Visible = (settings.espNames or settings.espDistance)
     objs.name.TextColor3 = col
-    -- vida
-    objs.hpBg.Visible = settings.espHealthBar
-    if settings.espHealthBar then
+    -- vida (solo si hay humanoide real; en bruto se oculta la barra)
+    objs.hpBg.Visible = settings.espHealthBar and hum ~= nil
+    if hum and settings.espHealthBar then
         local pct = math.clamp(hum.Health / math.max(1, hum.MaxHealth), 0, 1)
         objs.hpFill.Size = UDim2.new(pct, 0, 1, 0)
         objs.hpFill.BackgroundColor3 = Color3.fromHSV(pct * 0.33, 1, 1)
@@ -1351,8 +1544,7 @@ local function updateESP(plr)
         objs.tool.Visible = t ~= nil
         if t then objs.tool.Text = "🔫 " .. t.Name end
     else objs.tool.Visible = false end
-    if objs.hl then objs.hl.FillColor = col end
-    -- tracer
+    -- tracer sutil
     if settings.espTracer then
         local sp, on = camera:WorldToViewportPoint(root.Position)
         if on then
@@ -1362,27 +1554,53 @@ local function updateESP(plr)
             else startV = UserInputService:GetMouseLocation() end
             local endV = Vector2.new(sp.X, sp.Y)
             local d = (endV - startV).Magnitude
-            objs.line.Size = UDim2.new(0, 1.5, 0, d)
+            objs.line.Size = UDim2.new(0, 1.25, 0, d)
             objs.line.Position = UDim2.new(0, (startV.X + endV.X) / 2, 0, (startV.Y + endV.Y) / 2)
             objs.line.Rotation = math.deg(math.atan2(endV.Y - startV.Y, endV.X - startV.X)) - 90
             objs.line.BackgroundColor3 = col objs.line.Visible = true
         else objs.line.Visible = false end
     else objs.line.Visible = false end
-    -- box
+    -- box 2D (con fallback si no hay Head)
     if settings.espBox then
         local head = char:FindFirstChild("Head")
         local _, on = camera:WorldToViewportPoint(root.Position)
-        if on and head then
-            local hp = camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.6, 0))
-            local lp = camera:WorldToViewportPoint(root.Position - Vector3.new(0, 3, 0))
+        if on then
+            local top3d = head and (head.Position + Vector3.new(0, 0.6, 0)) or (root.Position + Vector3.new(0, 2.5, 0))
+            local bot3d = root.Position - Vector3.new(0, 3, 0)
+            local hp = camera:WorldToViewportPoint(top3d)
+            local lp = camera:WorldToViewportPoint(bot3d)
             local h = math.abs(hp.Y - lp.Y) local w = h * 0.62
-            objs.box.Size = UDim2.new(0, w, 0, h)
-            objs.box.Position = UDim2.new(0, hp.X - w / 2, 0, hp.Y)
-            objs.box.Visible = true objs.boxStroke.Color = col
+            if h > 4 then
+                objs.box.Size = UDim2.new(0, w, 0, h)
+                objs.box.Position = UDim2.new(0, hp.X - w / 2, 0, hp.Y)
+                objs.box.Visible = true objs.boxStroke.Color = col
+            else objs.box.Visible = false end
         else objs.box.Visible = false end
     else objs.box.Visible = false end
+    -- esqueleto sutil
+    if settings.skeleton then
+        local pm = {}
+        for _, c in ipairs(char:GetChildren()) do
+            if c:IsA("BasePart") then pm[c.Name] = c end
+        end
+        local list = pm["UpperTorso"] and SK_R15 or SK_R6
+        local si = 0
+        for _, s in ipairs(list) do
+            local a, b = pm[s[1]], pm[s[2]]
+            si = si + 1
+            local f = skSeg(objs, si)
+            if a and b then
+                local sa, ona = camera:WorldToViewportPoint(a.Position)
+                local sb, onb = camera:WorldToViewportPoint(b.Position)
+                if ona and onb then
+                    drawSeg(f, sa.X, sa.Y, sb.X, sb.Y, col)
+                else f.Visible = false end
+            else f.Visible = false end
+        end
+        for i = si + 1, #objs.sk do objs.sk[i].Visible = false end
+    else hideSk(objs) end
 end
-Players.PlayerRemoving:Connect(function(plr) clearESP(plr) espCharOf[plr] = nil end)
+Players.PlayerRemoving:Connect(function(plr) if not dead then clearESP(plr) espCharOf[plr] = nil end end)
 
 -- Punto de referencia del aim: cursor en PC, centro de pantalla en táctil (no hay cursor)
 local function aimRefPoint()
@@ -1399,59 +1617,15 @@ local function getAimPart(char, bone)
         or char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildWhichIsA("BasePart")
 end
 
---// SILENT AIM 👻 (redirige tiros sin mover la cámara)
-settings.silentBone = settings.silentBone or "Same as Aimbot"
-local silentHooked = false
-local silentBypass = false -- en true = son nuestros propios raycasts (wallcheck), no redirigir
-local silentFlash = 0 -- feedback visual: el FOV parpadea cuando el silent redirige un tiro
-local function silentBoneName()
-    if not settings.silentBone or settings.silentBone == "Same as Aimbot" then
-        return settings.targetPart
-    end
-    return settings.silentBone
-end
-local function getSilentHitPos()
-    if not settings.silentAimEnabled then return nil end
-    if math.random(1, 100) > (settings.silentHitChance or 100) then return nil end
-    local bone = silentBoneName()
-    local ml = aimRefPoint()
-    local lr = myRoot()
-    local bestPart, bestD = nil, settings.silentFov
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= localPlayer and isAlive(p) and not sameTeam(p, localPlayer) then
-            local part = getAimPart(p.Character, bone)
-            if part and lr and (lr.Position - part.Position).Magnitude <= settings.maxDistance then
-                -- wallbang ON = el silent ignora paredes (pega tras pared si el server no valida LOS)
-                local blocked = false
-                if not settings.wallbangEnabled then
-                    silentBypass = true
-                    blocked = hasWallBetween(camera.CFrame.Position, part.Position, part)
-                    silentBypass = false
-                end
-                if not blocked then
-                    local sp, on = camera:WorldToViewportPoint(part.Position)
-                    if on then
-                        local d = (Vector2.new(sp.X, sp.Y) - ml).Magnitude
-                        if d <= settings.silentFov and d < bestD then
-                            bestD = d bestPart = part
-                        end
-                    end
-                end
-            end
-        end
-    end
-    if bestPart then
-        local pred = settings.silentPrediction or 0.12
-        local vel = bestPart.Velocity
-        if vel.Magnitude > 60 then vel = vel.Unit * 60 end -- anti-fling loco
-        return bestPart.Position + (vel * pred), bestPart
-    end
-    return nil
-end
+-- (build sin silent: getSilentHitPos y hooks eliminados; magic sigue al aimbot)
 --// MAGIC BULLETS: tus proyectiles doblan su vuelo hacia el objetivo (respeta FOV, equipo, hitchance).
 -- Detecta piezas que NACEN cerca tuyo, en movimiento y alejándose (tus balas), e ignora el resto.
 local trackedBullets = {}
+local magicAcquired = 0 -- telemetría: balas con objetivo asignado
+local triggerShots = 0 -- telemetría: disparos del triggerbot
+local diagLast, diagF9Last = 0, 0 -- throttles del panel magic/trigger y del F9
 workspace.DescendantAdded:Connect(function(inst)
+    if dead then return end
     if not settings.magicBulletsEnabled or settings.ghostMode then return end
     if not inst or not inst:IsA("BasePart") then return end
     if inst.Anchored then return end
@@ -1467,11 +1641,18 @@ workspace.DescendantAdded:Connect(function(inst)
     local count = 0
     for _ in pairs(trackedBullets) do count = count + 1 end
     if count >= 40 then return end
-    -- hitchance una sola vez por bala: o vuela teledirigida o recta (parece legit)
-    local _, tgt = getSilentHitPos()
-    trackedBullets[inst] = {t0 = tick(), target = (tgt and tgt.Parent) and tgt or nil}
+    -- el objetivo es el del aimbot V1 (sin silent no hay getSilentHitPos)
+    local tgt = lastAimPart
+    local realTgt = (tgt and tgt.Parent) and tgt or nil
+    trackedBullets[inst] = {t0 = tick(), target = realTgt}
+    if realTgt then magicAcquired = magicAcquired + 1 end
+    if realTgt and not settings.magicNotified then
+        settings.magicNotified = true
+        notify("Magic Bullets", "Objetivo adquirido: curvando balas.")
+    end
 end)
 RunService.Heartbeat:Connect(function()
+    if dead then return end
     if not settings.magicBulletsEnabled or settings.ghostMode then return end
     local now = tick()
     for part, info in pairs(trackedBullets) do
@@ -1492,200 +1673,8 @@ RunService.Heartbeat:Connect(function()
         end
     end
 end)
---// SPY: registra qué manda tu arma (remotes/raycasts) en la consola F9. Solo LEE, indetectable.
--- Úsalo una vez por juego: dispara varias veces, abre F9 y pasa el log para adaptar el silent exacto.
-local spyHooked = false
-local spyLast, spyTotal = {}, 0
-function tryEnableSpy()
-    if spyHooked then notify("Spy", "Ya instalado. Dispara y abre la consola (F9).") return end
-    local ok, msg = pcall(function()
-        local hm = hookmetamethod
-        local gncm = getnamecallmethod
-        local chk = checkcaller
-        local nc = (newcclosure and newcclosure) or function(f) return f end
-        if not (hm and gncm) then error("executor sin hookmetamethod") end
-        local oldSpy
-        oldSpy = hm(game, "__namecall", nc(function(self, ...)
-            local method = gncm()
-            if settings.spyEnabled then
-                local s, r = pcall(chk)
-                if not (s and r) then
-                    if method == "FireServer" or method == "InvokeServer" or method == "Raycast"
-                    or method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList"
-                    or method == "FindPartOnRayWithWhitelist" then
-                        local nm = "?"
-                        pcall(function() nm = self:GetFullName() end)
-                        local key = method .. "|" .. nm
-                        local now = tick()
-                        if (spyLast[key] or 0) + 2 < now and spyTotal < 60 then
-                            spyLast[key] = now
-                            spyTotal = spyTotal + 1
-                            local n = select("#", ...)
-                            local parts = {}
-                            for i = 1, n do
-                                local a = select(i, ...)
-                                local t = typeof(a)
-                                if t == "Vector3" then parts[#parts + 1] = "V3" .. tostring(a)
-                                elseif t == "CFrame" then parts[#parts + 1] = "CF" .. tostring(a.Position)
-                                elseif t == "Ray" then parts[#parts + 1] = "Ray" .. tostring(a.Origin)
-                                elseif t == "Instance" then
-                                    local an = "?"
-                                    pcall(function() an = a:GetFullName() end)
-                                    parts[#parts + 1] = "Inst:" .. an
-                                else parts[#parts + 1] = t end
-                            end
-                            print("[ZVOLT-SPY]", method, nm, "n=" .. n, table.concat(parts, " | "))
-                        end
-                    end
-                end
-            end
-            return oldSpy(self, ...)
-        end))
-        spyHooked = true
-    end)
-    if spyHooked then notify("Spy", "Instalado. Dispara varias veces y abre F9.")
-    else notify("Spy", "Sin soporte de hooks: " .. tostring(msg)) end
-end
-local spyProjLast = 0
-workspace.DescendantAdded:Connect(function(inst)
-    if not settings.spyEnabled then return end
-    if not inst or not inst:IsA("BasePart") or inst.Anchored then return end
-    local mr = myRoot()
-    if not mr then return end
-    if (inst.Position - mr.Position).Magnitude > 30 then return end
-    if inst.AssemblyLinearVelocity.Magnitude < 30 then return end
-    local now = tick()
-    if now - spyProjLast < 1 then return end
-    spyProjLast = now
-    local pn = "?"
-    pcall(function() pn = inst:GetFullName() end)
-    print("[ZVOLT-SPY] parte rápida cerca:", pn, "vel:", math.floor(inst.AssemblyLinearVelocity.Magnitude))
-end)
-function tryEnableSilentAim()
-    if silentHooked then return end
-    local ok, msg = pcall(function()
-        local hm = hookmetamethod
-        local gncm = getnamecallmethod
-        local chk = checkcaller
-        local nc = (newcclosure and newcclosure) or function(f) return f end
-        if not (hm and gncm) then error("executor sin hookmetamethod") end
-        -- Hook único __namecall: 1) raycasts del cliente 2) remotes con hitreg en servidor
-        -- Muchos juegos NUNCA hacen Raycast en el cliente: mandan FireServer(pos) y el server registra.
-        -- Por eso se escanea cualquier Vector3 cercano a tu punto de mira y se cambia por el enemigo.
-        local oldNC
-        oldNC = hm(game, "__namecall", nc(function(self, ...)
-            local method = gncm()
-            local n = select("#", ...)
-            local args = table.pack(...)
-            local function isExploitCall()
-                if chk then local s, r = pcall(chk) if s and r then return true end end
-                return false
-            end
-            if settings.silentAimEnabled and not silentBypass and not isExploitCall() then
-                if method == "Raycast" then
-                    local origin, dir = args[1], args[2]
-                    if origin and dir and typeof(origin) == "Vector3" and typeof(dir) == "Vector3" and dir.Magnitude > 0 then
-                        local hitPos = getSilentHitPos()
-                        if hitPos then
-                            local ndir = (hitPos - origin)
-                            if ndir.Magnitude > 0 then
-                                local nargs = {origin, ndir.Unit * dir.Magnitude}
-                                for i = 3, n do nargs[i] = args[i] end
-                                silentFlash = 0.2
-                                return oldNC(self, table.unpack(nargs, 1, math.max(n, 2)))
-                            end
-                        end
-                    end
-                elseif method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" or method == "FindPartOnRay" then
-                    local ray = args[1]
-                    if ray and typeof(ray) == "Ray" then
-                        local hitPos = getSilentHitPos()
-                        if hitPos then
-                            local ndir = (hitPos - ray.Origin)
-                            if ndir.Magnitude > 0 then
-                                local newRay = Ray.new(ray.Origin, ndir.Unit * ray.Direction.Magnitude)
-                                local nargs = {newRay}
-                                for i = 2, n do nargs[i] = args[i] end
-                                silentFlash = 0.2
-                                return oldNC(self, table.unpack(nargs, 1, math.max(n, 1)))
-                            end
-                        end
-                    end
-                elseif method == "FireServer" or method == "InvokeServer" then
-                    local hitPos = getSilentHitPos()
-                    if hitPos then
-                        silentBypass = true
-                        local aimRef = nil
-                        pcall(function() aimRef = mouse.Hit.Position end)
-                        silentBypass = false
-                        local lr = myRoot()
-                        if aimRef and lr then
-                            local nargs = {}
-                            for i = 1, n do nargs[i] = args[i] end
-                            local changed = false
-                            -- 1) pares (origen, dirección): el formato más común (el server hace el raycast).
-                            -- Antes solo se tocaban posiciones y a veces se cambiaba el ORIGEN por error.
-                            for i = 1, n - 1 do
-                                local a, b = nargs[i], nargs[i + 1]
-                                if typeof(a) == "Vector3" and typeof(b) == "Vector3" then
-                                    local bm = b.Magnitude
-                                    local isDir = (bm > 0.85 and bm < 1.15)
-                                        or (bm > 1 and (b - aimRef).Magnitude > 30)
-                                    if isDir and (a - lr.Position).Magnitude < 25 then
-                                        local nd = hitPos - a
-                                        if nd.Magnitude > 0.5 then
-                                            nargs[i + 1] = nd.Unit * bm
-                                            changed = true
-                                        end
-                                    end
-                                end
-                            end
-                            -- 2) Vector3 de POSICIÓN cerca de tu mira pero LEJOS de ti (nunca el origen).
-                            for i = 1, n do
-                                local a = nargs[i]
-                                if typeof(a) == "Vector3" then
-                                    local dAim = (a - aimRef).Magnitude
-                                    local dMe = (a - lr.Position).Magnitude
-                                    if dAim > 3 and dAim <= 30 and dMe > 20 then
-                                        nargs[i] = hitPos
-                                        changed = true
-                                    end
-                                end
-                            end
-                            if changed then
-                                silentFlash = 0.2
-                                return oldNC(self, table.unpack(nargs, 1, n))
-                            end
-                        end
-                    end
-                end
-            end
-            return oldNC(self, ...)
-        end))
-        -- 2) Hook Mouse.Hit / Mouse.Target (juegos que disparan con mouse.Hit)
-        local oldIdx
-        oldIdx = hm(game, "__index", nc(function(self, k)
-            if settings.silentAimEnabled and not silentBypass and (self == mouse) and (k == "Hit" or k == "Target") then
-                local s, r = pcall(checkcaller)
-                local exploitCall = (s and r)
-                if not exploitCall then
-                    local hitPos, part = getSilentHitPos()
-                    if hitPos then
-                        if k == "Hit" then return CFrame.new(hitPos) end
-                        if k == "Target" then return part end
-                    end
-                end
-            end
-            return oldIdx(self, k)
-        end))
-        silentHooked = true
-    end)
-    if silentHooked then
-        notify("Silent Aim 👻", "Hook instalado. Dispara cerca y pega solo.")
-    else
-        notify("Silent Aim ⚠️", "Tu executor no soporta hooks (" .. tostring(msg) .. "). Usa Aimbot normal.")
-    end
-end
+-- (build sin silent: SPY por hooks eliminado)
+-- (build sin silent: hook tryEnableSilentAim eliminado)
 
 -- El aimbot V1 corre en el loop principal abajo (RenderStepped plano, como el original).
 
@@ -1725,43 +1714,80 @@ end
 pcall(function() RunService:UnbindFromRenderStep("ZV_Aimbot") end)
 pcall(function()
     -- prioridad Last (2000): corre DESPUÉS de cualquier cámara del juego, justo antes del render
-    RunService:BindToRenderStep("ZV_Aimbot", Enum.RenderPriority.Last.Value, function() reapplyAim() end)
+    RunService:BindToRenderStep("ZV_Cam", Enum.RenderPriority.Last.Value, function() reapplyAim() end)
 end)
 
 --// Loops principales
 local isTouch = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 local aimDeepLast = 0
-local lastAimPart = nil -- último objetivo: se re-aplica post-cámara aunque el juego la pise
+-- (lastAimPart vive arriba junto a orbitAngle; magic, V1 y reapply usan la misma variable)
+local espFrame, noclipLast, fbLastRefresh = 0, 0, 0 -- acumuladores de rendimiento
+local espDiagLast = 0 -- throttle del diagnóstico ESP en pantalla
+local espErr = nil -- último error de updateESP (el pcall lo tragaba en silencio)
 RunService.RenderStepped:Connect(function(dt)
+    if dead then return end
     -- La cámara puede ser REEMPLAZADA por el juego (rondas/respawns). Si usamos la vieja,
     -- todo da mal (pant:0) y escribimos en una cámara invisible. Re-leer cada frame lo arregla.
     local freshCam = workspace.CurrentCamera
     if freshCam then camera = freshCam end
     if not camera then return end
+    -- red de seguridad: cualquier error aquí saldría a consola con "loadstring" (baneable)
+    local okLoop, errLoop = pcall(function()
     -- FOV UI
     local ml = aimRefPoint()
-    local wantFov = (settings.aimEnabled or settings.silentAimEnabled) and settings.showFov
+    local wantFov = settings.aimEnabled and settings.showFov
     fovFrame.Visible = wantFov
     aimBtn.Visible = settings.aimEnabled and isTouch
     flyUpBtn.Visible = settings.flyEnabled and isTouch
     flyDownBtn.Visible = settings.flyEnabled and isTouch
-    if silentFlash > 0 then silentFlash = math.max(0, silentFlash - dt) end
     if wantFov then
-        -- cada aim usa su propio radio: el círculo muestra el del aimbot, o el del silent si solo ese está activo
-        local fr = (settings.aimEnabled and settings.fovRadius) or settings.silentFov
         fovFrame.Position = UDim2.new(0, ml.X, 0, ml.Y)
-        fovFrame.Size = UDim2.new(0, fr * 2, 0, fr * 2)
+        fovFrame.Size = UDim2.new(0, settings.fovRadius * 2, 0, settings.fovRadius * 2)
         fovDot.Position = UDim2.new(0.5, 0, 0.5, 0)
         if settings.fovRainbow then fovStroke.Color = Color3.fromHSV(tick() % 5 / 5, 1, 1)
         else fovStroke.Color = Accent() end
         fovDot.BackgroundColor3 = fovStroke.Color
-        -- el círculo se engrosa un instante cuando el silent redirige un tiro (confirmación visual)
-        fovStroke.Thickness = (silentFlash > 0) and 3.5 or 1.6
+        fovStroke.Thickness = 1.6
     end
-    -- ESP (con pcall por jugador: si un personaje raro falla, no arrastra al aimbot)
+    -- ESP intercalado: mitad de jugadores por frame (se ve igual, cuesta la mitad)
+    espFrame = espFrame + 1
     if settings.espEnabled then
-        for _, p in ipairs(Players:GetPlayers()) do if p ~= localPlayer then pcall(updateESP, p) end end
+        for i, p in ipairs(Players:GetPlayers()) do
+            if p ~= localPlayer and (i + espFrame) % 2 == 0 then
+                local okE, errE = pcall(updateESP, p)
+                if not okE and not espErr then espErr = errE end
+            end
+        end
+        -- diagnóstico en vivo: embudo del ESP (jugadores -> con root -> cerca)
+        local nowE = tick()
+        if nowE - espDiagLast > 0.5 then
+            espDiagLast = nowE
+            if espErr then
+                espStatus.Text = "ESP err: " .. tostring(espErr):sub(1, 90)
+                espStatus.TextColor3 = Color3.fromRGB(255, 110, 120)
+                espErr = nil
+            else
+            local eTot, eRoot, eNear = 0, 0, 0
+            local lrE = myRoot()
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= localPlayer then
+                    eTot = eTot + 1
+                    local ch = p.Character
+                    local rt = ch and ch:FindFirstChild("HumanoidRootPart")
+                    if rt then
+                        eRoot = eRoot + 1
+                        if lrE and (lrE.Position - rt.Position).Magnitude <= settings.maxDistance then
+                            eNear = eNear + 1
+                        end
+                    end
+                end
+            end
+            espStatus.Text = string.format("ESP: %d cerca (%d con root de %d juga)", eNear, eRoot, eTot)
+            espStatus.TextColor3 = (eNear > 0) and Color3.fromRGB(80, 255, 130) or Color3.fromRGB(255, 200, 80)
+            end
+        end
     else
+        espStatus.Text = ""
         for p, _ in pairs(espData) do clearESP(p) end
     end
     -- Aimbot estilo V1: RenderStepped plano, sin filtros extra. Fórmula del original que sí funciona.
@@ -1771,7 +1797,7 @@ RunService.RenderStepped:Connect(function(dt)
         if not settings.aimEnabled then
             aimStatus.Text = ""
         elseif not trigV1 then
-            aimStatus.Text = "AIM: ON - mantén click derecho"
+            aimStatus.Text = discreetText("AIM: ON - mantén click derecho")
             aimStatus.TextColor3 = COLOR_SUBTEXT
         else
             local ml2 = UserInputService:GetMouseLocation()
@@ -1825,7 +1851,7 @@ RunService.RenderStepped:Connect(function(dt)
                 end
             end
             if bestPartV1 then
-                aimStatus.Text = "AIM: LOCK " .. tostring(bestNameV1)
+                aimStatus.Text = discreetText("AIM: LOCK ") .. tostring(bestNameV1)
                 aimStatus.TextColor3 = Color3.fromRGB(80, 255, 130)
                 lastAimPart = bestPartV1
                 -- zona muerta: si ya estás encima del objetivo no toca la cámara (tu mouse manda)
@@ -1837,8 +1863,8 @@ RunService.RenderStepped:Connect(function(dt)
                     end)
                 end
             else
-                aimStatus.Text = string.format("AIM: 0 FOV (vivos:%d bots:%d partes:%d pant:%d)",
-                    cAlive, cBots, cPart, cScreen)
+                aimStatus.Text = discreetText(string.format("AIM: 0 FOV (vivos:%d bots:%d partes:%d pant:%d)",
+                    cAlive, cBots, cPart, cScreen))
                 aimStatus.TextColor3 = Color3.fromRGB(255, 200, 80)
                 lastAimPart = nil
                 if settings.aimDebug then
@@ -1859,7 +1885,7 @@ RunService.RenderStepped:Connect(function(dt)
                                 if lr2 then dist = math.floor((lr2.Position - anchor.Position).Magnitude) end
                             end
                             shown = shown + 1
-                            print(string.format("[ZVOLT-DEEP] %s | hum=%s hp=%s head=%s hrp=%s | pant=%s(%s) dist=%s",
+                            dprint(string.format("[sys-deep] %s | hum=%s hp=%s head=%s hrp=%s | pant=%s(%s) dist=%s",
                                 tostring(label), hum and "SI" or "NO", hum and tostring(math.floor(hum.Health)) or "-",
                                 hd and "SI" or "NO", hrp and "SI" or "NO",
                                 tostring(scr), tostring(on), tostring(dist)))
@@ -1878,6 +1904,32 @@ RunService.RenderStepped:Connect(function(dt)
                             end
                         end
                     end
+                end
+            end
+        end
+    end
+    -- Telemetría magic/trigger en pantalla + F9
+    do
+        local showS = settings.magicBulletsEnabled or settings.triggerbot
+        if not showS then
+            magicStatus.Text = ""
+        else
+            local nowD = tick()
+            if nowD - diagLast > 0.25 then
+                diagLast = nowD
+                local tracked = 0
+                for _ in pairs(trackedBullets) do tracked = tracked + 1 end
+                local t = "MAGIC: rastreadas:" .. tracked .. " dirigidas:" .. magicAcquired
+                    .. " | TRIGGER tiros:" .. triggerShots
+                magicStatus.Text = discreetText(t)
+                if nowD - diagF9Last > 4 then
+                    diagF9Last = nowD
+                    dprint(string.format(
+                        "[sys-diag] magic=%s tracked=%d acquired=%d trigger=%s shots=%d fov=%d",
+                        tostring(settings.magicBulletsEnabled),
+                        tracked, magicAcquired,
+                        tostring(settings.triggerbot), triggerShots,
+                        settings.fovRadius))
                 end
             end
         end
@@ -1928,8 +1980,19 @@ RunService.RenderStepped:Connect(function(dt)
     if settings.spinEnabled and not settings.ghostMode and r and not settings.trollTrackEnabled and not settings.trollOrbitEnabled and not settings.flingEnabled then
         r.CFrame = r.CFrame * CFrame.Angles(0, math.rad(settings.spinSpeed), 0)
     end
-    -- noclip (solo escribe si hace falta: menos escrituras = menos huellas)
-    if settings.noclipEnabled and localPlayer.Character then
+    -- jerk anti-aim: yaw aleatorio + micro-jitter cada frame (rompe locks enemigos)
+    if settings.jerkEnabled and not settings.ghostMode and r
+    and not settings.flyEnabled and not settings.trollTrackEnabled
+    and not settings.trollOrbitEnabled and not settings.flingEnabled then
+        local pw = settings.jerkPower or 5
+        r.CFrame = r.CFrame * CFrame.Angles(0, math.rad(math.random(-pw * 18, pw * 18)), 0)
+        r.CFrame = r.CFrame + Vector3.new((math.random() - 0.5) * pw * 0.5, 0, (math.random() - 0.5) * pw * 0.5)
+        r.Velocity = Vector3.zero
+        r.RotVelocity = Vector3.zero
+    end
+    -- noclip a 10Hz (listar piezas cada frame es caro) + solo escribe si hace falta
+    if settings.noclipEnabled and localPlayer.Character and tick() - noclipLast > 0.1 then
+        noclipLast = tick()
         for _, part in ipairs(localPlayer.Character:GetDescendants()) do
             if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
         end
@@ -1945,19 +2008,18 @@ RunService.RenderStepped:Connect(function(dt)
             if ch.FloorMaterial ~= Enum.Material.Air then ch:ChangeState(Enum.HumanoidStateType.Jumping) end
         end
     end
-    -- fullbright
-    if settings.fullbright then
-        Lighting.Brightness = 2 Lighting.ClockTime = 14 Lighting.FogEnd = 100000
-        Lighting.Ambient = Color3.fromRGB(255, 255, 255) Lighting.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
-    end
+    -- fullbright: se aplica al activar + refresco cada 2s (reescribirlo cada frame recalcula la luz y baja FPS)
     -- anti-void
     if settings.antiVoid and r and r.Position.Y < -60 then
         r.CFrame = CFrame.new(0, 20, 0) r.Velocity = Vector3.zero
     end
+    end)
+    if not okLoop then dprint("[sys] loop:", tostring(errLoop):sub(1, 90)) end
 end)
 
 -- Fly (Heartbeat, compatible móvil con joystick)
 RunService.Heartbeat:Connect(function(dt)
+    if dead then return end
     local r = myRoot() local h = myHum()
     if not r or not h then return end
     local trollActive = settings.trollTrackEnabled or settings.trollOrbitEnabled or settings.flingEnabled
@@ -1965,22 +2027,27 @@ RunService.Heartbeat:Connect(function(dt)
         h.PlatformStand = true
         local cf = camera.CFrame
         local mv = Vector3.zero
-        local md = h.MoveDirection -- funciona con joystick móvil ✅
-        if md.Magnitude > 0.1 then
-            local fwd = cf.LookVector * Vector3.new(1, 0, 1)
-            local rgt = cf.RightVector * Vector3.new(1, 0, 1)
-            if fwd.Magnitude > 0 then fwd = fwd.Unit else fwd = Vector3.zero end
-            if rgt.Magnitude > 0 then rgt = rgt.Unit else rgt = Vector3.zero end
-            mv = mv + (fwd * -md.Z) + (rgt * md.X)
-            -- joystick arriba = avanzar; si mira arriba/abajo también vuela vertical un poco
-            mv = mv + Vector3.new(0, (-md.Z) * cf.LookVector.Y * 0.8, 0)
+        if isTouch then
+            -- móvil: joystick (MoveDirection) + botones táctiles
+            local md = h.MoveDirection
+            if md.Magnitude > 0.1 then
+                local fwd = cf.LookVector * Vector3.new(1, 0, 1)
+                local rgt = cf.RightVector * Vector3.new(1, 0, 1)
+                if fwd.Magnitude > 0 then fwd = fwd.Unit else fwd = Vector3.zero end
+                if rgt.Magnitude > 0 then rgt = rgt.Unit else rgt = Vector3.zero end
+                mv = mv + (fwd * -md.Z) + (rgt * md.X)
+                -- joystick arriba = avanzar; si mira arriba/abajo también vuela vertical un poco
+                mv = mv + Vector3.new(0, (-md.Z) * cf.LookVector.Y * 0.8, 0)
+            end
+        else
+            -- PC: teclas (una sola vez; MoveDirection ya las incluye y duplicaba = diagonal)
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then mv = mv + cf.LookVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then mv = mv - cf.LookVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then mv = mv - cf.RightVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then mv = mv + cf.RightVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then mv = mv + Vector3.new(0, 1, 0) end
+            if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then mv = mv - Vector3.new(0, 1, 0) end
         end
-        if UserInputService:IsKeyDown(Enum.KeyCode.W) then mv = mv + cf.LookVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.S) then mv = mv - cf.LookVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.A) then mv = mv - cf.RightVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.D) then mv = mv + cf.RightVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then mv = mv + Vector3.new(0, 1, 0) end
-        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then mv = mv - Vector3.new(0, 1, 0) end
         if flyUpHeld then mv = mv + Vector3.new(0, 1, 0) end
         if flyDownHeld then mv = mv - Vector3.new(0, 1, 0) end
         if mv.Magnitude > 1 then mv = mv.Unit end
@@ -1993,18 +2060,20 @@ end)
 
 -- Loops lentos (ammo / rapid / fps-ping)
 task.spawn(function()
-    local frames, last, fps = 0, tick(), 60
+    local frames, last, fps, lastPing, pingCache = 0, tick(), 60, 0, "--"
     while true do
+        if dead then break end
         frames = frames + 1
         local now = tick()
         if now - last >= 1 then
             fps = math.floor(frames / (now - last)) frames = 0 last = now
-            local ping = "--"
-            pcall(function()
-                local s = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValueString()
-                ping = s
-            end)
-            statsLabel.Text = "FPS: " .. fps .. " • PING: " .. tostring(ping)
+            if now - lastPing >= 5 then
+                lastPing = now
+                pcall(function()
+                    pingCache = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValueString()
+                end)
+            end
+            statsLabel.Text = "FPS: " .. fps .. " • PING: " .. tostring(pingCache)
         end
         -- infinite ammo + rapid fire (cada 0.25s para no laggear)
         if (settings.ammoEnabled or settings.rapidFire) and not settings.ghostMode then
@@ -2044,8 +2113,14 @@ task.spawn(function()
                 end
             end
         end
-        -- wallbang REAL = el silent ignora paredes (ver getSilentHitPos) + X-ray para verlos.
+        -- (build sin silent: wallbang real eliminado con el silent)
         -- (El viejo loop de CanCollide no afectaba a las balas y se eliminó.)
+        -- refresco fullbright cada 2s por si el juego resetea la luz
+        if settings.fullbright and tick() - fbLastRefresh > 2 then
+            fbLastRefresh = tick()
+            Lighting.Brightness = 2 Lighting.ClockTime = 14 Lighting.FogEnd = 100000
+            Lighting.Ambient = Color3.fromRGB(255, 255, 255) Lighting.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
+        end
         task.wait(0.5)
     end
 end)
@@ -2054,6 +2129,7 @@ end)
 task.spawn(function()
     local lastShot = 0
     while true do
+        if dead then break end
         task.wait(0.05)
         if settings.triggerbot and not settings.ghostMode then
             local now = tick()
@@ -2062,7 +2138,8 @@ task.spawn(function()
                 local found = false
                 for _, p in ipairs(Players:GetPlayers()) do
                     if found then break end
-                    if p ~= localPlayer and isAlive(p) and not sameTeam(p, localPlayer) then
+                    local tAlive = (settings.aimBrute and p.Character ~= nil) or isAlive(p)
+                    if p ~= localPlayer and tAlive and not sameTeam(p, localPlayer) then
                         local part = p.Character and getAimPart(p.Character, settings.targetPart)
                         if part then
                             local sp, on = camera:WorldToViewportPoint(part.Position)
@@ -2089,6 +2166,7 @@ task.spawn(function()
                             vim:SendMouseButtonEvent(0, 0, 0, false, game, 0)
                         end
                     end)
+                    if ok then triggerShots = triggerShots + 1 end
                     if not ok and not settings.triggerWarned then
                         settings.triggerWarned = true
                         notify("Triggerbot", "Tu executor no soporta clicks.")
@@ -2100,7 +2178,11 @@ task.spawn(function()
 end)
 
 -- respawn: limpiar estados
-localPlayer.CharacterAdded:Connect(function()    task.wait(0.5)
+captureDefaults()
+localPlayer.CharacterAdded:Connect(function()
+    if dead then return end
+    captureDefaults()
+    task.wait(0.5)
     table.clear(hitboxOriginals) currentAimTarget = nil orbitAngle = 0
     for p, _ in pairs(espData) do clearESP(p) end
     refreshPlayers()
@@ -2124,5 +2206,5 @@ mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
 tween(mainFrame, TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
     Size = UDim2.new(0, 740, 0, 500), Position = UDim2.new(0.5, -370, 0.5, -250)
 })
-notify("ZVOLT V2.25 FULL", "Cargado. Usa cuenta alt. RightShift = ocultar.")
-print("[ZVOLT V2.25 FULL] cargado OK - menu limpio + mas utilidades")
+notify("ZVOLT V2.43", "Cargado. Usa cuenta alt. RightShift = ocultar.")
+dprint("[sys] cargado OK")
